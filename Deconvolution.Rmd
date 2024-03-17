@@ -1,0 +1,132 @@
+---
+title: "Deconvolution TCGA"
+author: "Dieter Henrik Heiland"
+date: "2024-03-17"
+output: pdf_document
+---
+
+
+## Run Cell Deconvolution:
+Here we run the cell type deconvolution using the single cell RNA-seq dataset (GBMapExtended) previously established by the GBMap along with the human neocortex dataset from the Allen Institute:
+
+## Load data:
+
+```{r}
+reticulate::use_condaenv("TF_M1")
+library(Seurat)
+library(tidyverse)
+library(SingleCellExperiment)
+library(digitalDLSorteR)
+
+#Get Single cell Data:
+ref <- readRDS("/.../GBMapExtended.RDS")
+
+## Use the reference:
+## as sc Experiment: 
+sc.obj <- Seurat::as.SingleCellExperiment(ref)
+colData(sc.obj)$Cell_ID <- rownames(colData(sc.obj))
+rowData(sc.obj)$Gene_ID <- rownames(rowData(sc.obj))
+
+```
+
+
+## We train the digitalDLSorteR for deconvolution:
+
+```{r}
+set.seed(123)
+
+DDLS <- loadSCProfiles(single.cell = sc.obj, 
+                       cell.ID.column = "Cell_ID",
+                       gene.ID.column = "Gene_ID",
+                       min.cells = 0,min.counts = 0,project = "GBMap")
+DDLS <- estimateZinbwaveParams(object = DDLS,
+                               cell.ID.column = "Cell_ID",
+                               gene.ID.column = "Gene_ID",
+                               cell.type.column = "annotation_level_4",
+                               subset.cells = 4000,
+                               threads = 10,
+                               verbose = TRUE)
+DDLS <- simSCProfiles(object = DDLS,
+                      cell.ID.column = "Cell_ID",
+                      cell.type.column = "annotation_level_4",
+                      n.cells = 10,
+                      suffix.names = "_Simul",verbose = TRUE)
+## prior knowledge (cell lables)
+probMatrix <- 
+  data.frame(annotation_level_4 = colData(DDLS@single.cell.real)$annotation_level_4) %>% 
+  group_by(annotation_level_4) %>% 
+  summarise(to=length(annotation_level_4)) %>% 
+  mutate(to=c(to/sum(to))*100) %>% 
+  mutate(q=round(to*0.2, digits = 0)) %>% 
+  mutate(from=to-q, to=to+q) %>% 
+  dplyr::select(annotation_level_4, from, to) %>% 
+  as.data.frame() %>% 
+  mutate(to=round(ifelse(to>10,99, c(to*10)+1), digits = 0),
+         from=round(ifelse(from>7, 70, from*10),digits = 0)) %>% 
+  mutate(sum=from+to) %>% 
+  mutate(from=ifelse(sum>100, from-c((sum-100)), from)) %>% 
+  dplyr::select(annotation_level_4, from, to)
+
+
+
+
+DDLS <- generateBulkCellMatrix(object = DDLS,cell.ID.column = "Cell_ID",cell.type.column = "annotation_level_4",prob.design = probMatrix,num.bulk.samples = 250,n.cells = 100,verbose = TRUE)
+
+DDLS <- simBulkProfiles( object = DDLS, type.data = "both", pseudobulk.function = "MeanCPM")
+DDLS <- trainDigitalDLSorterModel(object = DDLS, scaling = "standarize")
+
+#savemodel
+saveRDS(DDLS, "~/.../DDLS.RDS")
+```
+
+## Predict:
+
+```{r}
+## RNA-seq data TCGA database (see WGCNA script). Contains the RNA-seq along with methylation data
+obj <- readRDS("seurat.obj.RDS")
+
+### From Data
+counts <- obj@assays$RNA@counts %>% as.matrix()
+pheno <- obj@meta.data
+bulk <- ExpressionSet(assayData=counts)
+bulk@phenoData <- AnnotatedDataFrame(pheno)
+
+
+suppressMessages(library(SummarizedExperiment, quietly = TRUE))
+seExample <- SummarizedExperiment(assay = list(counts = counts))
+
+DDLS <- loadDeconvData(object = DDLS,data = seExample, name.data = "Simulated.example")
+DDLS <- deconvDigitalDLSorterObj(object = DDLS, name.data = "Simulated.example",normalize = TRUE,scaling = "standarize",verbose = FALSE)
+deconv <- DDLS@deconv.results %>% t() %>% as.data.frame()
+
+
+```
+
+## Plot:
+```{r}
+prop <- DDLS@deconv.results$Simulated.example %>% reshape2::melt()
+names(prop) <- c("samples", "type", "value")
+prop$set <- seurat@meta.data[prop$samples, ]$Type
+prop <- prop %>% arrange(set)
+prop$samples <- factor(prop$samples, levels = prop$samples %>% unique())
+colors <- readRDS("/.../color.RDS")
+
+## GGplot:
+col_types <- colors$colors
+names(col_types) <- colors$Celltype
+prop$type <- factor(prop$type, levels = colors$Celltype)
+
+p1 <- ggplot(data = prop, 
+       aes(x = samples, y = value, fill = type)) +
+  geom_bar(position = "fill", stat = "identity") + theme_classic()+
+  scale_fill_manual(values = col_types)+
+  xlab("samples") + 
+  ylab("Percentage") + 
+    theme(axis.text.y = element_text(color = "black"), 
+          axis.text.x = element_text(color = "white", 
+                                     angle = 75, 
+                                     vjust = 0.5))
+```
+
+
+

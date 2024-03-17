@@ -1,0 +1,156 @@
+---
+title: "GBMap Extension to neuronal phenotypes"
+author: "Dieter Henrik Heiland"
+date: "2023-11-04"
+output: html_document
+---
+
+
+```{r}
+library(Seurat)
+scRef <- readRDS(".../azimuth_core_GBmap.rds")
+scRef$annotation_level_4 <-
+  str_replace_all(scRef$annotation_level_4, "[ ]", "_") %>%
+  str_replace_all(., "-", "_") %>%
+  str_replace_all(., "/", "_")
+
+
+## Read Allen
+Allen_neurons <- readRDS(".../SCE_Neuron.RDS")
+meta.data <- read.csv(".../metadata.csv")
+rownames(meta.data) <- meta.data$exp_component_name
+
+seurat_allen <- readRDS(".../ref.Rds")
+cells <- intersect(rownames(seurat_allen[[]]), meta.data$exp_component_name)
+seurat_allen <- subset(seurat_allen, cells=cells)
+meta.data <- meta.data[cells, ]
+seurat_allen <- RenameCells(object = seurat_allen, new.names=meta.data$sample_name)
+
+allen_emb <- seurat_allen@reductions$refDR@cell.embeddings
+
+## Load data
+ref <- readRDS(".../GBMap_Neuron.RDS")
+ref$author[is.na(ref$annotation_level_2)] <- "AllenInst"
+ref$annotation_level_2[is.na(ref$annotation_level_2)] <- "Neurons"
+```
+
+### new supervised UMAP
+
+```{python}
+import umap
+import numpy as np
+
+
+data = r.emb
+cluster = r.celltypes
+
+data = np.array(data, dtype="float32")
+cluster = np.array(cluster)
+
+# To numeric vector 
+unique_labels, indices = np.unique(cluster, return_inverse=True)
+label_to_number = {label: index for index, label in enumerate(unique_labels)}
+numeric_array = np.array([label_to_number[label] for label in cluster])
+
+target = np.asarray(numeric_array)
+masked_target = target.copy().astype(np.int8)
+masked_target[np.random.choice(len(target), size=int(len(target)*0.9), replace=False)] = -1
+
+print("Run UMAP Fit")
+fitter = umap.UMAP().fit(data, y=masked_target)
+embedding = fitter.embedding_
+  
+#No noise  
+model = umap.UMAP()
+embedding = model.fit_transform(data, y=numeric_array)
+
+
+```
+
+```{r}
+plot_umap <- umap_integrated
+names(plot_umap)[1:2] <- c("UMAP1", "UMAP2")
+
+## Load a predefine color map
+colors <- readRDS(".../GBM_Neuron_colors.RDS")
+
+
+colors$annotation_level_4[1:54] <- 
+  str_replace_all(colors$annotation_level_4[1:54], "[ ]", "_") %>%
+  str_replace_all(., "-", "_") %>%
+  str_replace_all(., "/", "_")
+cc <- colors$colors;names(cc) <- colors$annotation_level_4
+
+plot_umap$celltypes <- factor(plot_umap$celltypes, levels = colors$annotation_level_4)
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+
+ggplot(plot_umap)+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP1, y=UMAP2), pointsize = 5, color="black")+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP1, y=UMAP2), pointsize = 4, color="white")+
+  geom_point(mapping=aes(x=UMAP1, y=UMAP2, color=celltypes), size=1)+
+  scale_color_manual(values = cc)+
+  #guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  coord_fixed()+
+  theme(legend.text = element_text(size=6),
+        legend.key.size = unit(0.3, "cm"),
+        legend.title = element_text(size=8))
+
+```
+
+## Add new ref map to ref object
+
+```{r}
+
+ref <- subset(ref, cells = rownames(plot_umap))
+
+emb <- plot_umap[1:2] %>% as.matrix()
+colnames(emb) <- c("UMAP_1", "UMAP_2")
+dim(emb)
+ref@reductions$umap <- Seurat::CreateDimReducObject(embeddings = emb, key="UMAP_", assay="RNA")
+
+meta.data
+
+
+DimPlot(ref, reduction = "umap")
+
+p <- FeaturePlot(ref, features = "RBFOX3", order=T)
+  
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+ggplot(p$data)+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 5, color="black")+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP_1, y=UMAP_2), pointsize = 4, color="white")+
+  geom_point(mapping=aes(x=UMAP_1, y=UMAP_2, color=RBFOX3), size=1)+
+  scale_color_gradientn(colours = col2(50),
+                        #limit=c(0.3,1), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  coord_fixed()+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  ggtitle("Expression: RBFOX3")+
+  xlab("Reference UMAP 1")+
+  ylab("Reference UMAP 2")
+
+
+```
+
+```{r}
+ saveRDS(ref,".../GBMap_Neuron.RDS")
+
+```
+
+
+
+

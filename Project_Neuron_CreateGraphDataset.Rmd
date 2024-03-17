@@ -1,0 +1,1530 @@
+---
+title: "Neuron Project (Deep learning)"
+author: "Dieter Henrik Heiland"
+date: "2023-11-06"
+output: pdf_document
+---
+
+## Recurrent: Analysis Therapy Impact and cellular architecture
+
+In first step of the analysis we prepare required data:
+```{r, warning=F, message=FALSE}
+reticulate::use_condaenv("torch-gpu")
+
+# Example R sample
+library(SPATA2)
+library(reticulate)
+library(tidyverse)
+library(igraph)
+require(kableExtra)
+setClass("GraphObject",representation(WG="list",Subgraphs="list"))
+Graph_object <-  new("GraphObject")
+setMethod(f = "show",
+          signature = "GraphObject",
+          definition = function(object){
+            print(paste0("The GraphObject contains: ", length(object@WG), " Spatial Graphs (Samples)"))
+
+            for(i in 1:length(object@Subgraphs)){
+
+              message(paste0("The sample (", i, ") contains: ", length(object@Subgraphs[[i]]), " Subgraphs"))
+
+            }
+
+
+          })
+
+
+features_var <- readRDS(".../Var_features.RDS")
+length(features_var)
+
+```
+
+The features are limited to 5000 (GBM specific) genes to decrease the computational time. Next we load the reference data: Next we load the meta data file which provide an overview of the samples:
+
+```{r}
+#load meta data
+meta <- readRDS(".../Clinical_Data_06_09_2023.RDS")
+output_folder <- ".../Graphs"
+files=meta$SPATA_Obj
+ID=meta$Samples_ID
+
+# Numeric encoding
+meta$WHO_Diag <- as.factor(meta$WHO_Diag)
+meta$Pathology <- as.factor(meta$Pathology)
+meta$Death <- as.factor(meta$Death)
+meta$n_Class <- as.numeric(meta$WHO_Diag)-1
+meta$n_Event <- as.numeric(meta$Death)-1
+meta$n_Status <- as.numeric(meta$Pathology)-1
+
+
+kable(data.frame(type=as.character(meta$WHO_Diag), 
+                 encode= as.numeric(meta$WHO_Diag)-1) %>% 
+        group_by(type,encode) %>% 
+        dplyr::count(), 
+      title = "Experimental Design", 
+      align = "c", bootstrap_options = c("condensed")) %>%
+  kable_styling(full_width = FALSE, position = "left")
+
+kable(data.frame(type=as.character(meta$Pathology), encode= as.numeric(meta$Pathology)-1) %>% group_by(type,encode) %>% dplyr::count(), 
+      title = "Experimental Design", 
+      align = "c", bootstrap_options = c("condensed")) %>%
+  kable_styling(full_width = FALSE, position = "left")
+
+kable(data.frame(type=as.character(meta$Death), encode= as.numeric(meta$Death)-1) %>% group_by(type,encode) %>% dplyr::count(), 
+      title = "Experimental Design", 
+      align = "c", bootstrap_options = c("condensed")) %>%
+  kable_styling(full_width = FALSE, position = "left")
+
+```
+
+## Recurrent: Analysis Therapy Create Subgraph Input datasets:
+
+Load objects SPATA and SPATAdeconv:
+
+```{r}
+## Add the neuron Score to the meta data:
+
+meta_scores <- readRDS(".../meta_scores.RDS")
+
+meta_scores <- 
+  meta_scores %>% 
+  mutate(status=ifelse(status=="P", "T", "R")) %>% 
+  mutate(Samples_ID=paste0(Tumors, "_", status))
+samples_inter <- intersect(meta_scores$Samples_ID, meta$Samples_ID)
+
+meta$Neuron_score <- 0
+meta[meta$Samples_ID %in% samples_inter, ]$Neuron_score <- meta_scores[meta_scores$Samples_ID %in% samples_inter, ]$Cortical_neurons
+
+```
+
+## Get sample subgraphs (This can take some minutes):
+```{r}
+files_rec <- recurent_samples$SPATA_Obj
+ID_run <- recurent_samples$Samples_ID
+
+
+### Define Function for loop
+getSampleSubgraph <- function(object, features_var, ID){
+  ## Subset Gene Exp matrix
+  object <- runGeneMaskObject(object, features_var)
+
+
+  if(!any(getFeatureNames(object)=="Annotation")){
+    object@fdata[[1]]$Annotation="Not_avaiable"
+  }
+
+  ## Add clinical data
+  target_meta <- meta %>% filter(Samples_ID %in% ID)
+
+  #Baseline clinical data
+  clinical_data <- data.frame(Samples_ID = ID,
+                              PFS=target_meta$PFS,
+                              Event=target_meta$n_Event,
+                              Neuron_score=target_meta$Neuron_score,
+                              TMZ=ifelse(target_meta$TMZ=="yes", 1,0),
+                              TTF=ifelse(target_meta$TTF=="yes", 1,0),
+                              PD1=ifelse(target_meta$CheckPoint=="yes", 1,0),
+                              CCNU=ifelse(target_meta$CCNU=="yes", 1,0),
+                              Status= target_meta$n_Status )
+
+  print(clinical_data)
+
+  Graph <- initiateSpataGraphObject(list(object),
+                                    random_n=1000,
+                                    add_node_feature = "Annotation",
+                                    genes_select=features_var[1:10],
+                                    clinical_data=clinical_data)
+  # Add Mask
+  Graph@Subgraphs[[1]] <- map(Graph@Subgraphs[[1]], .f=function(s){
+
+    if(nrow(s[[1]])>1){
+      masked_genes <- colSums(s[[2]])==0
+    }else{
+      masked_genes <- s[[2]]==0
+    }
+
+    masked_genes <- as.integer(masked_genes)
+    s[[8]] <- masked_genes
+    return(s)
+
+  },.progress = T)
+  Subgraph <- Graph@Subgraphs[[1]]
+
+}
+all_subgraphs <- map(1:length(files_rec), .f=function(i){
+  object <- readRDS(files_rec[i]) %>% SPATA2::updateSpataObject()
+  Subgraph <- getSampleSubgraph(object, features_var=features_var, ID=ID_run[i])
+  return(Subgraph)
+  
+} )
+
+```
+
+
+
+## Merge Subgraphs and metaData
+
+```{r}
+Subgraphs <- all_subgraphs[[1]]
+meta_data <-  all_subgraphs[[1]][[1]][[6]]
+for(i in 2:length(all_subgraphs)){
+  Subgraphs_new <- all_subgraphs[[i]]
+  Subgraphs <- c(Subgraphs, Subgraphs_new)
+  meta_data <- rbind(meta_data, all_subgraphs[[i]][[1]][[6]])
+  #Subgraph_data <-  rbind(Subgraph_data, all_subgraphs[[i]][[1]][[6]] %>% mutate(Subgraph=paste0("Subgraph_", 1:1000)))
+
+}
+```
+
+# Implement graphs in pytorch geometrics
+## Initiate Graph
+```{python}
+import numpy as np
+import pandas as pd
+import networkx as nx
+import torch
+import matplotlib as PL
+from tqdm import tqdm
+
+import torch_geometric.utils as utils
+from torch.nn import BatchNorm1d, Linear
+from torch_geometric.nn import GATConv
+from torch_geometric.data import DataLoader
+import sklearn
+from sklearn import preprocessing
+from torch_geometric.utils import add_self_loops
+from torch_geometric.data import Data
+
+def InitializeGraphObject(input_list):
+  
+  
+  index = len(input_list)
+  output_list = []
+  
+  for i in tqdm(range(index)):
+    
+    edges_df = input_list[i][0]
+    #edges_attr = input_list[i][1]
+    
+    nodes_Exp = input_list[i][1]
+    central_node = input_list[i][4]
+    graph_info = input_list[i][5]
+    gene_mask = input_list[i][7]
+    
+    
+    
+    ## Node features: Exp
+    #nf = nodes_Exp.to_numpy()
+    node_features = np.asarray(nodes_Exp, dtype="float32")
+    node_features_x = torch.as_tensor(node_features, dtype=torch.float)
+    
+    
+    ## Node features: Histology
+    #nf = nodes_Hist.to_numpy()
+    #node_features = np.asarray(nf[:,1], dtype="int8")
+    #node_features.shape
+    #node_features_z = torch.as_tensor(node_features, dtype=torch.float)
+    
+    
+    ## Central node
+    central_node_index = np.asarray(central_node, dtype="int8")
+    central_node_index = torch.tensor(central_node_index, dtype=torch.long)
+    
+    
+    ## Gene expression of the central node
+    node_features_y = torch.as_tensor(node_features_x[central_node_index==1,:], dtype=torch.float)
+    ## Histology of the central node
+    #node_features_hc = torch.as_tensor(node_features_z[central_node_index==1], dtype=torch.float)
+  
+    ## Edges  
+    nx_graph = nx.from_pandas_edgelist(edges_df, "from", "to")
+    ptg_data = utils.from_networkx(nx_graph)
+    
+    # Node Information
+    ptg_data.x = node_features_x
+    #ptg_data.h = node_features_z
+    #ptg_data.hc = node_features_hc
+    ptg_data.y = node_features_y
+    ptg_data.central_node_index = central_node_index
+    
+     # Subgraph Information
+    ptg_data.PFS = torch.as_tensor(np.asarray(graph_info["PFS"], dtype="float32"), dtype=torch.float)
+    ptg_data.Neuron_score = torch.as_tensor(np.asarray(graph_info["Neuron_score"], dtype="float32"), dtype=torch.float)
+    ptg_data.Event = torch.as_tensor(np.asarray(graph_info["Event"], dtype="int8"), dtype=torch.float)
+    ptg_data.Status = torch.as_tensor(np.asarray(graph_info["Status"], dtype="int8"), dtype=torch.float)
+    
+    output_list.append(ptg_data)
+  
+  return output_list
+
+
+```
+
+## Run Function:
+```{python}
+graph = InitializeGraphObject(r.Subgraphs)
+```
+
+
+## QC Remove Graphs with insuff. nodes
+```{python}
+import matplotlib.pyplot as plt
+
+## QC
+nodes = []
+for i in tqdm(range(len(graph))):
+  nodes.append(graph[i].num_nodes)
+
+plt.hist(np.hstack(nodes), bins=100)
+plt.show()
+plt.close()
+```
+
+```{python}
+
+print(len(nodes))
+index=np.where(np.hstack(nodes)!=1)[0]
+graph = [graph[i] for i in index]
+print(len(graph))
+
+```
+
+
+
+Save Data for Training (in Colab):
+```{python}
+#Save Subgraph
+torch.save(graph, '../Neuron_Score_train.pt')
+```
+
+## Save Data:
+```{r}
+saveRDS(Subgraphs, "../AllSubgraphs_Neuron.RDS")
+saveRDS(py$index, "../AllSubgraphs_Neuron_Index.RDS")
+
+```
+
+
+
+## Define Architecture and Function:
+```{python}
+
+import os
+import torch
+import numpy as np
+import pandas as pd
+import networkx as nx
+import torch
+import torch_geometric.utils as utils
+import matplotlib as PL
+from tqdm import tqdm
+import sklearn
+from sklearn import preprocessing
+import matplotlib.pyplot as plt
+
+import torch
+from torch.nn import BatchNorm1d, Linear
+from torch_geometric.nn import GATConv
+from torch_geometric.loader import DataLoader
+from torch_geometric.utils import add_self_loops
+from torch_geometric.data import Data
+import torch.nn.functional as F
+from torch_geometric.nn import GINConv
+from torch.nn import Linear
+import torch.optim as optim
+from torch_geometric.nn import global_mean_pool
+
+import torch
+import torch.nn as nn
+
+#Loss Function
+
+def cox_ph_loss(risk_scores, survival_time, event, alpha=0.5, lambda_reg=1e-4):
+
+    # Sort by survival times
+    sorted_indices = torch.argsort(survival_time, descending=True)
+    sorted_risk_scores = risk_scores[sorted_indices]
+    sorted_event = event[sorted_indices]
+
+    # Compute hazard ratio
+    hazard_ratio = torch.exp(sorted_risk_scores)
+
+    # Compute log risk
+    log_risk = torch.log(torch.cumsum(hazard_ratio, dim=0))
+
+    # Compute the uncensored likelihood
+    uncensored_likelihood = sorted_risk_scores - log_risk
+
+    # Select only uncensored (i.e., event occurred) and compute their contribution
+    censored_likelihood = uncensored_likelihood * sorted_event
+
+    # Negative log partial likelihood
+    num_observed_events = torch.sum(sorted_event)
+    neg_log_partial_likelihood = -torch.sum(censored_likelihood) / num_observed_events
+
+    # L1 and L2 regularization terms
+    l1_term = torch.norm(risk_scores, 1)
+    l2_term = torch.norm(risk_scores, 2)
+
+    # Final loss
+    loss = neg_log_partial_likelihood + lambda_reg * ((1 - alpha) * l2_term + alpha * l1_term)
+
+    return loss
+
+## Model Architecture
+
+class GINModelBatchesExp(torch.nn.Module):
+    def __init__(self, num_features_exp, hidden_channels, num_classes):
+        super(GINModelBatchesExp, self).__init__()
+
+        # Expression GIN Conv Layer
+        self.conv1_exp = GINConv(Linear(num_features_exp, hidden_channels), train_eps=True)
+        self.conv2_exp = GINConv(Linear(hidden_channels, hidden_channels), train_eps=True)
+
+        # Batch norm layer
+        self.bn1 = torch.nn.BatchNorm1d(hidden_channels)
+        self.bn2 = torch.nn.BatchNorm1d(hidden_channels)
+        self.dropout = torch.nn.Dropout(0.5) # Add dropout for regularization
+
+        # Latent space
+        self.merge = Linear(hidden_channels, hidden_channels)
+
+        # Initiate weights
+        torch.nn.init.xavier_uniform_(self.merge.weight.data)
+
+        # MLP Prediction Survival
+        self.mlp_surv = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.Dropout(0.5), # Add dropout in the MLP as well
+            torch.nn.Linear(hidden_channels, 1)
+        )
+        # MLP Prediction Status
+        self.mlp_Status = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.Dropout(0.5), # Add dropout in the MLP as well
+            torch.nn.Linear(hidden_channels, 2)
+        )
+
+        # MLP Prediction Neuron Score
+        self.mlp_Neuron = torch.nn.Sequential(
+            torch.nn.Linear(hidden_channels, hidden_channels),
+            torch.nn.ReLU(),
+            torch.nn.BatchNorm1d(hidden_channels),
+            torch.nn.Dropout(0.5), # Add dropout in the MLP as well
+            torch.nn.Linear(hidden_channels, 1)
+        )
+
+
+    def forward(self, data):
+        exp, edge_index = data.x, data.edge_index
+
+        edge_index, _ = add_self_loops(edge_index, num_nodes=exp.size(0))
+
+        x_exp = self.conv1_exp(exp, edge_index)
+        x_exp = self.dropout(F.leaky_relu(self.bn1(x_exp), negative_slope=0.2))
+
+        x_exp = self.conv2_exp(x_exp, edge_index)
+        x_exp = self.dropout(F.leaky_relu(self.bn2(x_exp), negative_slope=0.2))
+
+        x = self.merge(x_exp)
+        x = F.leaky_relu(x, negative_slope=0.2)
+
+        Neuron_out = self.mlp_Neuron(global_mean_pool(x, data.batch))
+        surv_out = self.mlp_surv(global_mean_pool(x, data.batch))
+        Status_out = self.mlp_Status(global_mean_pool(x, data.batch))
+
+
+        return x, surv_out, Neuron_out, Status_out
+
+## Training loop
+
+def RunGINClassBatchExp(graph, hidden_channels = 256, num_classes=10, epochs = 50,learning_rate = 0.001, batch_size=32):
+
+  num_features_exp = graph[1].x.shape[1]
+
+  model = GINModelBatchesExp(num_features_exp, hidden_channels, num_classes=num_classes)
+  optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+
+  model.train()
+  loader = DataLoader(graph, batch_size=batch_size, shuffle=F)
+
+  criterion1 = torch.nn.CrossEntropyLoss()
+  criterion2 = torch.nn.L1Loss()
+
+
+  epoch_loss_list = []
+  epoch_loss = 0
+
+  data = next(iter(loader))
+
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  print("Running on:", device)
+  model = model.to(device)
+
+
+  for epoch in tqdm(range(epochs), desc="Training"):
+    for data in loader:
+        optimizer.zero_grad()
+        latent, surv_out, Neuron_out, Status_out = model(data.to(device))
+
+        # Surv loss
+        surv = data.PFS.long()
+        status = data.Event.long()
+        loss1 = cox_ph_loss(surv_out, surv, status)
+
+        # Status loss
+        Status_gt = data.Status.long()
+        loss2 = criterion1(Status_out, Status_gt)
+
+
+        Neuron_gt = data.Neuron_score.view(len(data.Neuron_score), 1)
+        loss3 = criterion2(Neuron_out, Neuron_gt)
+
+        loss = (loss1+loss2+loss3)/3
+
+
+        loss.backward()
+        optimizer.step()
+        epoch_loss += loss.item()
+
+    epoch_loss /= len(loader)
+    epoch_loss_list.append(epoch_loss)
+
+  import matplotlib.pyplot as plt
+  plt.close()
+  plt.scatter(range(len(epoch_loss_list)), epoch_loss_list)
+  plt.show()
+  plt.close()
+
+  return(model)
+
+## Evaluation Function:
+
+def RunEvaluationGINClass(graph, model):
+
+  model.eval()
+  latent_space = []
+  OS_risk = []
+  Neuron_score = []
+  Status = []
+  Status_logits=[]
+
+  device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+  print("Running on:", device)
+
+  model.to(device)
+  for data in tqdm(graph, desc="Eval"):
+    latent, surv_out, Neuron_out, Status_out = model(data.to(device))
+
+    ## Latent space
+    latent_space.append(latent.mean(dim=0, keepdim=True).detach().cpu().numpy())
+
+    ## Status
+    Status_logits.append(Status_out.detach().cpu().numpy())
+    status_arg = torch.argmax(Status_out, dim=1)
+    Status.append(status_arg.detach().cpu().numpy())
+
+    ## OS risk score
+    Neuron_score.append(Neuron_out.detach().cpu().numpy())
+
+    ## OS risk score
+    OS_risk.append(surv_out.detach().cpu().numpy())
+
+
+
+  #status_logits_all = np.asarray(status_logits)
+
+
+  return(np.concatenate(latent_space),np.concatenate(Neuron_score),np.concatenate(Status_logits),np.concatenate(Status), np.concatenate(OS_risk))
+
+
+
+
+```
+
+## Run training:
+This training should be run on a gpu cluster. We used a local gpu cluster or colab for the training.
+```{python}
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Running on:", device)
+model = RunGINClassBatchExp(graph, num_classes=10, epochs=40)
+torch.save(model, '../Neuron_score_model.pth')
+
+```
+
+
+## Save Data for Training (in Colab):
+## Read Data
+```{r}
+Subgraphs = readRDS(".../upload/to/cluster/AllSubgraphs_Neuron.RDS")
+```
+
+## Load the data after training:
+```{python}
+model = torch.load('/../Neuron_score_model.pth')
+graph = torch.load('/../Neuron_Score_train.pt')
+graph_ctr = torch.load("/../Graph_Neuron_Project.pt")
+
+```
+
+
+## Evaluate model
+```{python}
+eval = RunEvaluationGINClass(graph, model)
+#eval_ctr = RunEvaluationGINClass(graph_ctr, model)
+
+gt = []
+for i in tqdm(range(len(graph))):
+  gt.append(graph[i].Neuron_score.detach().cpu().numpy()) 
+gt = np.hstack(gt)
+
+pred = eval[1]
+
+```
+
+## UMAP from latent space:
+```{python}
+import numpy as np
+import umap
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+print("Run UMAP Fit")
+fitter = umap.UMAP().fit(eval[0])
+embedding = fitter.embedding_
+
+```
+
+## Plot:
+```{r}
+
+plot_umap <- data.frame(py$embedding)
+names(plot_umap) <- c("UMAP1", "UMAP2")
+plot_umap$Neuron_score_GT <- py$gt
+plot_umap$Neuron_score_pred <- py$pred
+
+plot_umap <- 
+  plot_umap %>% 
+  rownames_to_column("Subgraph") %>% 
+  mutate(pat=map_chr(Subgraphs[py$index+1], ~.x[[6]]$Samples_ID),
+         barcodes = map_chr(Subgraphs[py$index+1], ~ .x[[1]]$from[.x[[8]]] %>% unique() )
+         )
+  
+
+saveRDS(plot_umap, "/.../Analysis_Step1.RDS")
+
+```
+
+
+```{r}
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+ggplot(plot_umap)+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP1, y=UMAP2), pointsize = 3.5, color="black")+
+  scattermore::geom_scattermore(mapping=aes(x=UMAP1, y=UMAP2), pointsize = 2, color="white")+
+  geom_point(mapping=aes(x=UMAP1, y=UMAP2, color=Neuron_score_pred), size=0.5)+
+  scale_color_gradientn(colours = col2(50),
+                        limit=c(0.3,0.4), 
+                        oob = scales::squish, na.value = "white",name="")+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+
+```
+
+# Analysis and Metrics
+```{r}
+
+pat_level <- 
+  plot_umap %>% 
+  group_by(pat) %>% 
+  summarise(gt=median(Neuron_score_GT), 
+            pred=median(Neuron_score_pred), 
+            range= c(range(Neuron_score_pred)[2]-range(Neuron_score_pred)[1]) )
+
+
+ggplot(pat_level)+
+  geom_point(mapping=aes(x=gt, y=pred))+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  coord_fixed()+
+  ggtitle(paste0("Metric R-square: ", round(cor(pat_level$pred, pat_level$gt)^2, digits=2 )))
+
+
+```
+
+
+```{r}
+plot_umap <- 
+plot_umap %>% 
+  mutate(norm_score=map(unique(plot_umap$pat), .f=function(pat_x){
+                            plot_umap %>% 
+                              filter(pat==pat_x) %>% 
+                              pull(Neuron_score_pred) %>% 
+                              scales::rescale(.,c(0,1))} ) %>% unlist(),
+         Neural=ifelse(Neuron_score_pred>0.41, "green", "red"),
+         Samples_ID=pat
+         )
+
+
+plot_umap <- 
+  left_join(plot_umap, meta %>% filter(Samples_ID %in% plot_umap$Samples_ID ) %>% select(Samples_ID,RTK_1_score, RTK_2_score, MES_score), by="Samples_ID")
+for(i in c("RTK_1_score", "RTK_2_score", "MES_score")){plot_umap[,i] <- as.numeric(plot_umap[,i])}
+
+Meth_score <- 
+  plot_umap %>% select(Samples_ID,RTK_1_score, RTK_2_score, MES_score) %>% group_by(Samples_ID) %>% summarise_all(.funs = mean) %>% 
+  pivot_longer(cols = c(RTK_1_score, RTK_2_score, MES_score), names_to = "Meth_type", values_to = "Meth_score")
+
+library(scales)
+col=colorRampPalette(rev(RColorBrewer::brewer.pal(9, "PRGn")))
+library(ggridges)
+a <- ggplot(plot_umap, aes(x = Neuron_score_pred, y = pat, group = pat)) + 
+  scale_y_discrete(limits=pat_level %>% arrange(desc(pred)) %>% pull(pat))+
+  geom_density_ridges(fill="grey")+
+  theme_bw() +
+  scattermore::geom_scattermore(plot_umap, 
+                                mapping=aes(x = Neuron_score_pred, y = pat, color=Neuron_score_pred), 
+                                pointsize = 5, pch= "|", pixels = c(1000, 1000))+
+  scale_color_gradientn(colors = col(50), 
+                        name="", 
+                        limits=c(0.30,0.52), 
+                        oob=scales::squish)+
+  geom_point(data=pat_level, mapping=aes(x=gt, y=pat), size=4)+
+  geom_vline(xintercept=0.41)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  xlim(0.1, 0.7)+
+  Seurat::NoLegend()
+
+b=ggplot(Meth_score, aes(y=Meth_type, x=Meth_score, fill=Meth_type))+ 
+                geom_bar(stat="identity") + 
+                facet_grid(factor(Samples_ID, levels = pat_level %>% arrange(pred) %>% pull(pat)) ~ .)+
+   theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_blank(),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        strip.text.y = element_blank())
+  
+
+
+a+b
+
+```
+
+```{r}
+saveRDS(plot_umap, "/../Analysis_Step2.RDS")
+```
+
+# Analysis of individual samples:
+
+## Run short single cell Deconvolution
+```{r}
+sample_to_run <- "818_T"
+```
+
+After initializing the object, we will work on the images. Lets get the image output
+```{r}
+
+obj_path <- meta %>% filter(Samples_ID == sample_to_run) %>% pull(SPATA_Obj)
+object <- readRDS(obj_path) %>% SPATA2::updateSpataObject()
+object <- SPATA2::setImageDirHighres(object,
+  paste0( meta %>% filter(Samples_ID == sample_to_run) %>% pull(SpaceRanger), "/outs/spatial/tissue_hires_image.png"))
+HE_Img <- SPATA2::getImageDirHighres(object)
+folder <- str_remove(HE_Img, "/tissue_hires_image.png")
+```
+
+Now, we will segment the nucleus positions.
+
+### Get single nucleus positions
+
+We start our pipeline using the ilastk software for segmentation of the nucleus. The Ilastik pipeline is predefined:
+
+```{r, echo=FALSE}
+Sys.setenv(pipeline = "/.../Ilastik/Segmentation.ilp")
+Sys.setenv(folder = folder)
+Sys.setenv(IMG = HE_Img)
+```
+
+After setting all parameters for the pipline, we run the pretrained ilastik object classifier from command line. This chunck is optimized for Mac users and needs to be adopted to you running system.
+
+```{bash, echo=FALSE}
+# Run the Cell Profiler Pipeline
+#Set home directory
+cd $folder
+#Run Ilastik Pipeline
+/Applications/ilastik-1.4.1b6-arm64-OSX.app/Contents/ilastik-release/run_ilastik.sh --headless --project=$pipeline $IMG
+
+```
+
+
+```{r}
+# In case of low imaging QC we calculate the cells per spot by the CytoSpace algorith and assume a mean of 6 cells per spot. More detail in the methods:
+
+if(!file.exists(paste0(folder, "/Center_table.csv"))){
+  
+  
+object <- SPATA2::exchangeImage(object, image=SPATA2::getImageDirHighres(object))
+UMIs <- object %>% SPATA2::joinWith(features = "nCount_Spatial") %>% pull(nCount_Spatial) %>% log2()
+a <- UMIs %>% qplot()
+
+x=c(min(UMIs), mean(UMIs))
+y=c(1,6)
+lmfit <- lm(y~x)
+new <- data.frame(x = UMIs)
+nr_cells <- predict(lmfit, new) %>% as.integer()
+
+cell_file <- 
+  object %>% 
+  SPATA2::joinWith(features = "nCount_Spatial") %>% 
+  mutate(UMIs=log2(nCount_Spatial),
+         nr_cells= nr_cells)
+
+## Create a cell position file
+# Prams: Spotradius
+getSpotRadius <- function(object){
+    of_sample <- SPATA2::getSampleNames(object)
+    coords <- SPATA2::getCoordsDf(object)
+    bc_origin <- coords$barcodes
+    bc_destination <- coords$barcodes
+    d <-
+      tidyr::expand_grid(bc_origin, bc_destination) %>%
+      dplyr::left_join(x = ., y = dplyr::select(coords, bc_origin = barcodes, xo = x, yo = y), by = "bc_origin") %>%
+      dplyr::left_join(x = ., y = dplyr::select(coords, bc_destination = barcodes, xd = x, yd = y), by = "bc_destination") %>%
+      dplyr::mutate(distance = base::round(base::sqrt((xd - xo)^2 + (yd - yo)^2), digits = 0)) %>%
+      dplyr::filter(distance!=0) %>%
+      dplyr::pull(distance) %>%
+      min()
+
+    r = (d * c(55/100))/2
+
+    return(r)
+  }
+r <- getSpotRadius(object)
+extension=0.5
+
+segemt_out <- 
+  map_dfr(1:nrow(cell_file), .f=function(i){
+  
+  x_coord <- cell_file[i, ]$x
+  y_coord <- cell_file[i, ]$y
+  nr_cells <- cell_file[i, ]$nr_cells
+  spread_f <- r+r*extension
+  x_generated <- runif(nr_cells, x_coord-c(spread_f), x_coord+c(spread_f))
+  y_generated <- runif(nr_cells, y_coord-c(spread_f), y_coord+c(spread_f))
+  return(data.frame(barcodes=cell_file[i, ]$barcodes, x=x_generated, y=y_generated, Nr_of_cells=nr_cells))
+  
+  
+}, .progress = T)
+segemt_out$cells <- paste0("Cell_", 1:nrow(segemt_out))
+
+## Adopt format of output
+
+segments <- 
+  list(Feature_cells=data.frame(barcodes=cell_file$barcodes, Cells=cell_file$nr_cells),
+       DF_Segments=segemt_out %>% dplyr::select(barcodes,Nr_of_cells,cells))
+pos <- data.frame(Cell=segemt_out$cells, x=segemt_out$x, y=segemt_out$y)
+
+SPATA2::plotSurface(object, pt_alpha=0)+
+  geom_point(data=pos, mapping=aes(x,y), size=0.1)
+  
+}else{
+  "Ilastic segmentation succesfull"
+}
+
+```
+
+CytoSpace Method:
+The number of detectably expressed genes per cell (‘gene counts’) tightly corresponds to total captured mRNA content, as measured by the sum of unique molecular identifiers (UMIs) per cell45. As gene counts are routinely used as a proxy for doublets or multiplets in scRNA-seq experiments, we hypothesized that the sum of UMIs per ST spot may reasonably approximate the number of cells per spot, as required for the second step of CytoSPACE (Fig. 1a). To test this hypoth- esis while blunting the effect of outliers, technical variation and the impact of cell volume46, we first normalized UMIs to CPM per spot and then performed log2 adjustment. We then estimated the number of cells per ST spot by fitting a linear function through two points. For the first point, we assumed that the minimum number of cells per spot is 1 and that this minimum in cell number corresponds to the minimum sum of UMIs in log2 space. For the second point, we assumed that the mean number of cells per spot corresponds to the mean sum of UMIs in log2 space and set this value according to user input. For 10x Visium samples in which spots generally contain 1–10+ cells per spot, we employed a mean of five cells per spot throughout this work.
+
+
+Lets import the center.csv file to process by SPATA:
+
+```{r}
+if(file.exists(paste0(folder, "/Center_table.csv"))){
+
+pos <- read.csv(paste0(folder, "/Center_table.csv"))
+pos <- data.frame(x=pos$Object.Center_0, y=pos$Object.Center_1)
+
+#We need to flip y
+object <- SPATA2::exchangeImage(object, image=SPATA2::getImageDirHighres(object))
+pos$y <- SPATA2::getImageRange(object)$y[2] - pos$y + SPATA2::getImageRange(object)$y[1]
+
+## plot spatial
+a <- SPATA2::plotSurface(object, pt_alpha=0)+
+  geom_point(data=pos, mapping=aes(x,y), size=0.1)
+
+coords <- SPATA2::getCoordsDf(object)
+
+## Cut sample edges
+pos <- 
+  pos %>% 
+  filter(x>min(coords$x)) %>% 
+  filter(x<max(coords$x)) %>% 
+  filter(y>min(coords$y)) %>% 
+  filter(y<max(coords$y))
+
+b <- SPATA2::plotSurface(object, pt_alpha=0)+
+  geom_point(data=pos, mapping=aes(x,y), size=0.1)
+
+library(patchwork)
+a+b
+
+
+}else{
+  message("No Ilastik Segmentation found")
+}
+
+```
+
+### Flip y if nessessary:
+
+```{r}
+object <- SPATA2::flipCoordinates(object, axis="h")
+```
+
+
+
+Get the cells per spot:
+
+```{r}
+library(spAnchor)
+if(file.exists(paste0(folder, "/Center_table.csv"))){
+pos$Cell <- paste0("Cell_", 1:nrow(pos))
+pos <- pos[,c("Cell", "x", "y")]
+segments <- runSegmentfromCoords(object, Coord_file = pos, multicore = F, spot_extension=0.5)
+}else{ message("No Ilastik Segmentation found") }
+
+object <- SPATA2::addFeatures(object, segments$Feature_cells, overwrite = T)
+SPATA2::plotSurface(object,color_by="Cells", display_image=F)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.25),
+          axis.text.x = element_text(colour="black"), 
+          axis.text.y = element_text(colour="black"))+
+  guides(color=guide_colorbar(barwidth=0.5, barheight = 15, ticks=F, frame.colour="black"))+
+    SPATA2::ggpLayerAxesSI(object)+
+  xlab("Dimension x [cm]")+
+  ylab("Dimension y [cm]")
+
+```
+
+### Adopt the tissue boarder
+
+```{r}
+
+#If the tissue is not correctly found by the spaceranger pipeline:
+
+#object <- SPATA2::createSegmentation(object)
+#bc <- getFeatureDf(object) %>% filter(Outline=="Tissue") %>% pull(barcodes)
+#object <- SPATA2::subsetByBarcodes(object, barcodes = bc)
+
+SPATA2::plotSurface(object,color_by="Cells", display_image=F)+
+  theme_bw() +
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.25),
+          axis.text.x = element_text(colour="black"), 
+          axis.text.y = element_text(colour="black"))+
+  guides(color=guide_colorbar(barwidth=0.5, barheight = 15, ticks=F, frame.colour="black"))+
+    SPATA2::ggpLayerAxesSI(object)+
+  xlab("Dimension x [cm]")+
+  ylab("Dimension y [cm]")
+
+
+```
+
+## Run deconvolution
+```{r}
+library(spAnchor)
+library(SPATA2)
+library(tidyverse)
+library(Seurat)
+library(tidyverse)
+
+sample <- SPATA2::getSampleName(object)
+deconv_cell_types <- as.character(SPATA2::getFeatureNames(object))[8:60]
+coords <- SPATA2::getCoordsDf(object) %>% select(barcodes, x, y)
+
+## Optimize the spots that have no cell detected (by the seg) and add a pseudo cell in the middle of the spot
+
+cc <- segments
+segments <- cc$DF_Segments
+
+if(nrow(segments[segments$Nr_of_cells==0, ])>0){
+  
+  len <- nrow(segments[segments$Nr_of_cells==0, ])
+  nrow(pos)
+
+  zero <- 
+  segments[segments$Nr_of_cells==0, ] %>% 
+  mutate(Nr_of_cells=1) %>% 
+  mutate(Cell=paste0("Cell_", c(nrow(pos)+1):c(nrow(pos)+len))) %>% 
+  mutate(cells=paste0("Cell_", c(nrow(pos)+1):c(nrow(pos)+len))) %>% 
+  left_join(., coords, by="barcodes")
+
+pos <- rbind(pos, data.frame(Cell=zero$Cell, x=zero$x, y=zero$y))
+object@spatial[[sample]]$Cell_coords <- pos
+cc_seg <- rbind(segments[segments$Nr_of_cells!=0, ], zero[,1:3])
+
+}else{
+  cc_seg <- segments
+}
+
+```
+
+```{r}
+cell_types <- getCellperSpot(object,
+                             deconv_cell_types = deconv_cell_types, 
+                             segments=cc_seg)
+```
+
+## Plot the results of cell deconvolution:
+```{r}
+gg_voronoi <- function(data, orginal_data, extend=0.2){
+
+  cells <- orginal_data
+  sub <- unique(data$barcodes)
+  cell_ID <- data$cells
+
+  x_range <- cells %>% filter(barcodes %in% sub) %>% pull(x) %>% range()
+  y_range <- cells %>% filter(barcodes %in% sub) %>% pull(y) %>% range()
+
+  x_range[1] <- x_range[1]-c(x_range[2]-x_range[1])*extend
+  x_range[2] <- x_range[2]+c(x_range[2]-x_range[1])*extend
+  y_range[1] <- y_range[1]-c(y_range[2]-y_range[1])*extend
+  y_range[2] <- y_range[2]+c(y_range[2]-y_range[1])*extend
+
+  plot_df <-
+    cells %>%
+    filter(x>x_range[1] & x<x_range[2]) %>%
+    filter(y>y_range[1] & y<y_range[2]) %>%
+    mutate(Graph=ifelse(barcodes %in% sub, T, F))
+
+  rownames(plot_df) <- plot_df$cells
+  plot_df[cell_ID, ]$celltypes <- data$celltypes
+
+  plot_df[plot_df$Graph==F, ]$celltypes="no"
+  cc <- c(cc, no="#FFFFFF")
+
+  library(ggforce)
+  p <- 
+    ggplot(plot_df, aes(x, y, group = -1L)) +
+    geom_voronoi_tile(aes(fill = celltypes), max.radius = 10, colour = 'black', linewidth=0.1)+
+    scale_fill_manual(values=cc)+
+    theme_bw() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black"),
+          axis.text.y = element_text(colour="black"))+
+    xlim(x_range)+
+    ylim(y_range)+
+    coord_fixed()
+    #Seurat::NoLegend()
+
+  return(p)
+
+}
+plotSubgraph <- function(object, Subgraph, nr_subgraph, orginal_data,extend=0.2){
+
+  ## Plot a Subgraph
+  plot_df <- SPATA2::getCoordsDf(object)
+  sub <- Subgraph[[nr_subgraph]][[2]] %>% rownames()
+
+  plot_df$graph=1
+  plot_df[plot_df$barcodes %in% sub, ]$graph=0.2
+
+  p <- ggplot()+
+    geom_point(data=plot_df,mapping=aes(x,y,alpha=graph), size=6)+
+    theme_classic()+
+    coord_equal()
+
+  cells <- orginal_data %>% filter(barcodes %in% sub)
+  #p+geom_point(data=cells, mapping=aes(x,y,color=celltypes), size=1)
+  gg_voronoi(data=cells, orginal_data, extend=extend)
+
+}
+
+```
+
+
+## Plot functions:
+```{r}
+
+N_high <- 
+  plot_umap %>% 
+  filter(Sample_ID==sample_to_run) %>% 
+  arrange(desc(Neuron_score_pred)) %>% 
+  head(20) %>% 
+  pull(Subgraph) %>% 
+  as.numeric()
+
+
+N_low <- 
+  plot_umap %>% 
+  filter(Sample_ID==sample_to_run) %>% 
+  arrange((Neuron_score_pred)) %>% 
+  head(3) %>% 
+  pull(Subgraph) %>% 
+  as.numeric()
+
+
+colors <- readRDS("/.../colors_cell_deconv.RDS")
+cc <- colors$colors;names(cc) <- colors$annotation_level_4
+
+plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_high[1], orginal_data=cell_types, extend = 0.5)+Seurat::NoLegend()+
+plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_high[5], orginal_data=cell_types, extend = 0.5)+Seurat::NoLegend()+
+  plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_high[10], orginal_data=cell_types, extend = 0.5)
+
+
+plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_low[1], orginal_data=cell_types, extend = 0.5)+Seurat::NoLegend()+
+plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_low[2], orginal_data=cell_types, extend = 0.5)+Seurat::NoLegend()+
+  plotSubgraph(object, Subgraph=Subgraphs, nr_subgraph=N_low[3], orginal_data=cell_types, extend = 0.5)
+
+
+```
+
+```{r}
+library(scales)
+col=colorRampPalette(rev(RColorBrewer::brewer.pal(9, "PRGn")))
+
+library(ggridges)
+ggplot(plot_umap %>% filter(Sample_ID==sample_to_run), aes(x = Neuron_score_pred, y = pat, group = pat)) + 
+  #scale_y_discrete(limits=pat_level %>% arrange(desc(pred)) %>% pull(pat))+
+  geom_density_ridges(fill="grey")+
+  theme_bw() +
+  scattermore::geom_scattermore(plot_umap %>% filter(Sample_ID==sample_to_run), 
+                                mapping=aes(x = Neuron_score_pred, y = pat, color=Neuron_score_pred), 
+                                pointsize = 10, pch= "|", pixels = c(1000, 1000))+
+  scale_color_gradientn(colors = col(50), 
+                        name="", 
+                        limits=c(0.30,0.52), 
+                        oob=scales::squish)+
+  geom_point(data=pat_level%>% filter(pat==sample_to_run), mapping=aes(x=gt, y=pat), size=4)+
+  geom_vline(xintercept=0.41)+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))
+```
+
+## Analysis of cellular compositions:
+```{r}
+
+# get cellular composition per subgraph
+cell_deconv_values <- map(unique(plot_umap$Samples_ID), .f=function(pat){
+  obj_path <- meta %>% filter(Samples_ID == pat) %>% pull(SPATA_Obj)
+  object <- readRDS(obj_path) %>% SPATA2::updateSpataObject()
+  
+  cell_dist <- 
+    joinWithFeatures(object, features = deconv_cell_types) %>% 
+    select(barcodes, {{deconv_cell_types}}) 
+
+  return(cell_dist)
+})
+names(cell_deconv_values) <- unique(plot_umap$Samples_ID)
+
+
+df_cell_dist <- map_dfr(1:nrow(plot_umap), .f=function(i){
+  
+  bcs <- Subgraphs[[i]][[1]]$from %>% unique()
+  sample <- plot_umap$Samples_ID[i]
+  mean_cell <- cell_deconv_values[[sample]] %>% filter(barcodes %in% bcs) %>% select(-barcodes) %>% colMeans()
+  
+  return(data.frame(cells=deconv_cell_types, values=mean_cell, Subgraph=i, Samples_ID=sample, Neuronal_score=plot_umap$Neuron_score_pred[i]))
+  
+}, .progress=T)
+rownames(df_cell_dist) <- NULL
+
+```
+
+
+```{r}
+df_cell_dist <- na.omit(df_cell_dist)
+NPC <- unique(df_cell_dist$cells)[unique(df_cell_dist$cells) %>% str_detect("NPC")]
+unique(df_cell_dist$cells)
+
+
+ggplot()+
+  geom_point(data=df_cell_dist %>% filter(cells %in% "AC_like_Prolif") %>% filter(values>0.2),
+             mapping=aes(x=Neuronal_score, y=values,alpha=values), color="green")+
+  geom_point(data=df_cell_dist %>% filter(cells %in% "Oligodendrocyte") %>% filter(values>0.2),
+             mapping=aes(x=Neuronal_score, y=values, alpha=values), color="blue")+
+  geom_point(data=df_cell_dist %>% filter(cells %in% NPC) %>% filter(values>0.2),
+             mapping=aes(x=Neuronal_score, y=values, alpha=values), color="red")+
+  geom_point(data=df_cell_dist %>% filter(cells %in% "Astrocyte") %>% filter(values>0.2),
+             mapping=aes(x=Neuronal_score, y=values, alpha=values), color="orange")+
+  xlim(0.2, 0.8)
+
+ggplot(df_cell_dist %>% filter(values>0.2))+
+  scattermore::geom_scattermore(aes(x=Neuronal_score, y=values,alpha=values, color=cells), pointsize = 4)+
+  scale_alpha(range = c(0, 1), limits=c(0.2, 1), oob=scales::squish)+
+  scale_color_manual(values=cc)+
+  xlim(0.2, 0.8)+
+  ylim(0.2, 1)+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  Seurat::NoLegend()+
+  coord_fixed()
+  
+
+cor_mat <- df_cell_dist %>% group_by(cells) %>% summarise(cor=cor(Neuronal_score, values))
+
+
+ggplot(cor_mat)+
+  geom_point(aes(x=cells,y=cor, color=cells), size=3)+
+  scale_x_discrete(limits=cor_mat %>% arrange(cor) %>% pull(cells))+
+  scale_color_manual(values=cc)+
+  theme_bw()+
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black", angle=90, hjust=1),
+        axis.text.y = element_text(colour="black"))+
+  Seurat::NoLegend()
+
+
+
+```
+
+## Different sample (as an example)
+```{r}
+# Test the 269 sample
+i=72
+ID[i]
+
+object <- readRDS(files[i]) %>% SPATA2::updateSpataObject()
+object_deconv <- readRDS("/../269_T_spAnchor_list.RDS")
+Graph <- readRDS(paste0(output_folder, "/Graph_", ID[i], ".RDS"))
+
+```
+
+## Get Subgraph of the whole sample:
+```{r}
+getSampleSubgraphSample <- function(object, features_var, ID){
+  ## Subset Gene Exp matrix
+  object <- runGeneMaskObject(object, features_var)
+
+
+  if(!any(getFeatureNames(object)=="Annotation")){
+    object@fdata[[1]]$Annotation="Not_avaiable"
+  }
+
+  ## Add clinical data
+  target_meta <- meta %>% filter(Samples_ID %in% ID)
+
+  #Baseline clinical data
+  clinical_data <- data.frame(Samples_ID = ID,
+                              PFS=target_meta$PFS,
+                              Event=target_meta$n_Event,
+                              Neuron_score=target_meta$Neuron_score,
+                              TMZ=ifelse(target_meta$TMZ=="yes", 1,0),
+                              TTF=ifelse(target_meta$TTF=="yes", 1,0),
+                              PD1=ifelse(target_meta$CheckPoint=="yes", 1,0),
+                              CCNU=ifelse(target_meta$CCNU=="yes", 1,0),
+                              Status= target_meta$n_Status )
+
+  print(clinical_data)
+
+  Graph <- initiateSpataGraphObject(list(object),
+                                    add_node_feature = "Annotation",
+                                    genes_select=features_var[1:10],
+                                    clinical_data=clinical_data)
+  # Add Mask
+  Graph@Subgraphs[[1]] <- map(Graph@Subgraphs[[1]], .f=function(s){
+
+    if(nrow(s[[1]])>1){
+      masked_genes <- colSums(s[[2]])==0
+    }else{
+      masked_genes <- s[[2]]==0
+    }
+
+    masked_genes <- as.integer(masked_genes)
+    s[[8]] <- masked_genes
+    return(s)
+
+  },.progress = T)
+  Subgraph <- Graph@Subgraphs[[1]]
+
+}
+Subgraph <- getSampleSubgraphSample(object, features_var=features_var, ID=ID[i])
+```
+
+## Create Sample pyTorch graph:
+```{python}
+graph = InitializeGraphObject(r.Subgraph)
+
+## QC:
+## QC
+nodes = []
+for i in tqdm(range(len(graph))):
+  nodes.append(graph[i].num_nodes)
+  
+print(len(nodes))
+index=np.where(np.hstack(nodes)!=1)[0]
+graph = [graph[i] for i in index]
+print(len(graph))
+
+```
+
+
+## Evaluate Sample
+```{python}
+eval = RunEvaluationGINClass(graph, model)
+#eval_ctr = RunEvaluationGINClass(graph_ctr, model)
+
+gt = []
+for i in tqdm(range(len(graph))):
+  gt.append(graph[i].Neuron_score.detach().cpu().numpy()) 
+gt = np.hstack(gt)
+
+pred = eval[1]
+
+```
+
+## Add predicted feature to SPATA2 object:
+```{r}
+Subgraph <- Subgraph[py$index+1]
+
+Predictions <- 
+  data.frame(
+    barcodes=map(1:length(Subgraph), ~ rownames(Subgraph[[.x]][[4]][Subgraph[[.x]][[5]]==1, ])) %>% unlist(),
+    Neuron_score_pred = py$pred) %>% 
+  rownames_to_column("Subgraph")
+
+object <- SPATA2::addFeatures(object, Predictions)
+
+```
+
+```{r}
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Reds")))
+plotSurface(object, color_by="Neuron_score_pred", alpha_by="Neuron_score_pred", display_image=T)+
+  scale_color_gradientn(colours = col2(50),
+                        limits=c(0.2, 0.35),
+                        oob = scales::squish, na.value = "white",name="")+
+  scale_alpha(range=c(0,0.5), oob = scales::squish,guide = 'none')+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  SPATA2::ggpLayerAxesSI(object)+
+  #SPATA2::ggpLayerTissueOutline(object, line_size=0.5, line_color = "black")+
+  xlab("Dimension in (mm)")+
+  ylab("Dimension in (mm)")
+```
+
+```{r}
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+plotSurface(object, color_by="SNAP25", alpha_by="SNAP25", display_image=T)+
+  scale_color_gradientn(colours = col2(50),
+                        limits=c(0, 0.8),
+                        oob = scales::squish, na.value = "white",name="")+
+  scale_alpha(range=c(0,0.5), oob = scales::squish,guide = 'none')+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  SPATA2::ggpLayerAxesSI(object)+
+  #SPATA2::ggpLayerTissueOutline(object, line_size=0.5, line_color = "black")+
+  xlab("Dimension in (mm)")+
+  ylab("Dimension in (mm)")
+```
+
+
+## Another example: normal cortex
+
+```{r}
+# Test the 269 sample
+i=125
+ID[i]
+
+object <- readRDS(files[i]) %>% SPATA2::updateSpataObject()
+
+```
+
+```{r}
+getSampleSubgraphSample <- function(object, features_var, ID){
+  ## Subset Gene Exp matrix
+  object <- runGeneMaskObject(object, features_var)
+
+
+  if(!any(getFeatureNames(object)=="Annotation")){
+    object@fdata[[1]]$Annotation="Not_avaiable"
+  }
+
+  ## Add clinical data
+  target_meta <- meta %>% filter(Samples_ID %in% ID)
+
+  #Baseline clinical data
+  clinical_data <- data.frame(Samples_ID = ID,
+                              PFS=target_meta$PFS,
+                              Event=target_meta$n_Event,
+                              Neuron_score=0,
+                              TMZ=ifelse(target_meta$TMZ=="yes", 1,0),
+                              TTF=ifelse(target_meta$TTF=="yes", 1,0),
+                              PD1=ifelse(target_meta$CheckPoint=="yes", 1,0),
+                              CCNU=ifelse(target_meta$CCNU=="yes", 1,0),
+                              Status= target_meta$n_Status )
+
+  print(clinical_data)
+
+  Graph <- initiateSpataGraphObject(list(object),
+                                    add_node_feature = "Annotation",
+                                    genes_select=features_var[1:10],
+                                    clinical_data=clinical_data)
+  # Add Mask
+  Graph@Subgraphs[[1]] <- map(Graph@Subgraphs[[1]], .f=function(s){
+
+    if(nrow(s[[1]])>1){
+      masked_genes <- colSums(s[[2]])==0
+    }else{
+      masked_genes <- s[[2]]==0
+    }
+
+    masked_genes <- as.integer(masked_genes)
+    s[[8]] <- masked_genes
+    return(s)
+
+  },.progress = T)
+  Subgraph <- Graph@Subgraphs[[1]]
+
+}
+Subgraph <- getSampleSubgraphSample(object, features_var=features_var, ID=ID[i])
+for(i in 1: length(Subgraph)){
+  
+  Subgraph[[i]][[6]]$PFS <- 0
+  Subgraph[[i]][[6]]$Event <- 0
+  Subgraph[[i]][[6]]$TTF <- 0
+  Subgraph[[i]][[6]]$PFS <- 0
+}
+
+
+```
+
+
+## Create Sample pyTorch graph:
+```{python}
+graph = InitializeGraphObject(r.Subgraph)
+
+## QC:
+## QC
+nodes = []
+for i in tqdm(range(len(graph))):
+  nodes.append(graph[i].num_nodes)
+  
+print(len(nodes))
+index=np.where(np.hstack(nodes)!=1)[0]
+graph = [graph[i] for i in index]
+print(len(graph))
+
+```
+
+
+## Evaluate Sample
+```{python}
+eval = RunEvaluationGINClass(graph, model)
+#eval_ctr = RunEvaluationGINClass(graph_ctr, model)
+
+gt = []
+for i in tqdm(range(len(graph))):
+  gt.append(graph[i].Neuron_score.detach().cpu().numpy()) 
+gt = np.hstack(gt)
+
+pred = eval[1]
+
+```
+
+
+```{r}
+Subgraph <- Subgraph[py$index+1]
+
+Predictions <- 
+  data.frame(
+    barcodes=map(1:length(Subgraph), ~ rownames(Subgraph[[.x]][[4]][Subgraph[[.x]][[5]]==1, ])) %>% unlist(),
+    Neuron_score_pred = py$pred) %>% 
+  rownames_to_column("Subgraph")
+
+object <- SPATA2::addFeatures(object, Predictions)
+
+```
+```{r}
+object <- SPATA2::exchangeImage(object, "/.../256_C/outs/spatial/tissue_hires_image.png")
+```
+
+
+```{r}
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Reds")))
+plotSurface(object, color_by="Neuron_score_pred", alpha_by="Neuron_score_pred", display_image=T)+
+  scale_color_gradientn(colours = col2(50),
+                        limits=c(0, 1),
+                        oob = scales::squish, na.value = "white",name="")+
+  scale_alpha(range=c(0,0.5), oob = scales::squish,guide = 'none')+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  SPATA2::ggpLayerAxesSI(object)+
+  #SPATA2::ggpLayerTissueOutline(object, line_size=0.5, line_color = "black")+
+  xlab("Dimension in (mm)")+
+  ylab("Dimension in (mm)")
+
+
+
+
+
+```
+
+```{r}
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+plotSurface(object, color_by="SNAP25", alpha_by="SNAP25", display_image=T)+
+  scale_color_gradientn(colours = col2(50),
+                        limits=c(0, 0.8),
+                        oob = scales::squish, na.value = "white",name="")+
+  scale_alpha(range=c(0,0.8), oob = scales::squish,guide = 'none')+
+  guides(color = guide_colourbar(barwidth = 0.3, barheight = 8, ticks =F, frame.colour="black"), label=F)+
+  theme_bw() +
+  theme(panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(colour = "black", size=0.5),
+        axis.text.x = element_text(colour="black"),
+        axis.text.y = element_text(colour="black"))+
+  SPATA2::ggpLayerAxesSI(object)+
+  #SPATA2::ggpLayerTissueOutline(object, line_size=0.5, line_color = "black")+
+  xlab("Dimension in (mm)")+
+  ylab("Dimension in (mm)")
+```
+

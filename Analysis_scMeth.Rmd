@@ -1,0 +1,778 @@
+---
+title: "Analysis Neuron single cell Methylation"
+author: "Dieter Henrik Heiland"
+date: "2024-02-02"
+output: pdf_document
+---
+
+```{r}
+reticulate::use_condaenv("torch-gpu")
+
+# Example R sample
+library(SPATA2)
+library(reticulate)
+library(Seurat)
+library(tidyverse)
+library(igraph)
+require(kableExtra)
+library(ggnewscale)
+## Hexalgon Plot
+plotHexagonScatter <- function(df, pt.size=1, color_by=NULL,lable_dist=0.2, ...){
+  
+  message(".....:::::: Format Data :::::::::..........")
+  
+  df.1 <- df[, 1:6]
+  Data2 <- 
+    apply(df.1,1, function(x) {
+      x %>% 
+        as.numeric() %>% 
+        scales::rescale(., c(0,1))  %>% 
+        ohenery::normalize() }) %>% 
+    t() %>% 
+    as.data.frame()
+  names(Data2) <- names(df.1)[1:6]
+  
+  
+  message(".....:::::: Plot Data :::::::::..........")
+  
+  ### Plot Hexagon
+  path <- data.frame(Mes1 = c(1,0,0,0,0,0), Mes2 = c(0,1,0,0,0,0), Neu1 = c(0,0,1,0,0,0), Neu2 = c(0,0,0,1,0,0), OPC = c(0,0,0,0,0,1), AC = c(0,0,0,0,1,0))
+  path <- 
+    path %>%
+    mutate(Mes1.x = Mes1*cos(pi/2), Mes1.y = Mes1*sin(pi/2), 
+           Mes2.x = Mes2*cos(pi/6), Mes2.y = Mes2*sin(pi/6),
+           Neu1.x = Neu1*cos(pi/6), Neu1.y = -Neu1*sin(pi/6),
+           Neu2.x = -Neu2*cos(pi/2), Neu2.y = -Neu2*sin(pi/2),
+           AC.x= -AC*cos(pi/6),   AC.y = -AC*sin(pi/6),
+           OPC.x = -OPC*cos(pi/6),    OPC.y = OPC*sin(pi/6)) %>% 
+    mutate(x = round(Mes1.x + Mes2.x + Neu1.x+Neu2.x+OPC.x+AC.x), y = Mes1.y + Mes2.y + Neu1.y+Neu2.y+OPC.y+AC.y)
+  
+  
+  p <- 
+    ggplot()+
+    geom_path(mapping=aes(x = c(path$x, 0), y=c(path$y,1)))+
+    theme_void()+
+    geom_text(mapping=aes(x = c(path$x+path$x*lable_dist), y=c(path$y+path$y*0.1), label= names(Data2)), size = 5)+
+    theme(plot.margin = margin(3, 3, 3, 3, "cm"))+
+    coord_cartesian(clip = "off")
+  
+  
+  # Add data Layer
+  names(Data2) <- c("Mes1","Mes2", "Neu1","Neu2", "OPC", "AC" )
+  
+  Data <- 
+    Data2 %>%
+    mutate(Mes1.x = Mes1*cos(pi/2), Mes1.y = Mes1*sin(pi/2), 
+           Mes2.x = Mes2*cos(pi/6), Mes2.y = Mes2*sin(pi/6),
+           Neu1.x = Neu1*cos(pi/6), Neu1.y = -Neu1*sin(pi/6),
+           Neu2.x = -Neu2*cos(pi/2), Neu2.y = -Neu2*sin(pi/2),
+           AC.x= -AC*cos(pi/6),   AC.y = -AC*sin(pi/6),
+           OPC.x = -OPC*cos(pi/6),    OPC.y = OPC*sin(pi/6)) %>% 
+    mutate(x = (Mes1.x + Mes2.x + Neu1.x+Neu2.x+OPC.x+AC.x), y = Mes1.y + Mes2.y + Neu1.y+Neu2.y+OPC.y+AC.y)
+  
+  if(is.null(color_by)){
+    p=p+geom_point(Data, mapping=aes(x,y, ...))
+  }else{
+    Data$color <- df[,color_by] %>% as.character()
+    p=p+geom_point(Data, mapping=aes(x,y, color=color,...))
+  }
+  
+  
+  return(p)
+  
+}
+
+```
+
+## Import methylation Data:
+
+```{r}
+
+meth <- read.csv("~/.../Multi-omic single cell data/DNAme/Chaligne_single_cell_DNAme.csv")
+
+dim(meth)
+names(meth)[1:10]
+meth$variable[1:10]
+
+meth <- meth %>% t()
+meth[1:10,1:10]
+
+barcodes <- meth["variable", ]
+type <- meth["Type2", ]
+cpGs <- rownames(meth)[4:nrow(meth)]
+
+meth_dat <- meth[4:nrow(meth), ]
+dim(meth_dat)
+
+
+cell_type <- data.frame(cell = barcodes, type=type)
+
+meth_dat[1:20,1:20]
+
+## masked CpGs as "-1"
+meth_dat[is.na(meth_dat)] <- -1
+meth_dat <- matrix(as.numeric(as.vector(meth_dat)), nrow = nrow(meth_dat))
+
+rownames(meth_dat) <- cpGs
+colnames(meth_dat) <- barcodes
+
+meth_dat[1:20,1:20]
+
+dim(meth_dat)
+
+```
+
+
+## Import single cell data:
+```{r}
+rna <- read.table("~/.../RNA/GBM_raw_counts.txt", header=T)
+rna[1:10,1:10]
+
+genes <- rna$GENE
+rna <- rna[,2:ncol(rna)]
+rownames(rna) <- genes
+dim(rna)
+
+
+
+intersect(names(rna), colnames(meth_dat))
+
+meta_data <- read.table("~/.../Multi-omic single cell data/RNA/metadata/allQC_POST_filtered_50K_10232020.csv", header = T, sep=",")
+
+head(meta_data)
+
+```
+
+## Match cells
+```{r}
+library(readxl)
+Chaligne_supp <- read_excel("~/.../Chaligne_supp.xlsx")
+match <- data.frame(RNA_cells=Chaligne_supp$Cell, DNA_cells=Chaligne_supp$DNAmeMatchingCell)
+
+```
+
+
+```{r}
+
+match <- na.omit(match)
+match_dna <- intersect(match$DNA_cells, colnames(meth_dat))
+match_rna <- intersect(match$RNA_cells, colnames(rna))
+
+match <- match %>% filter(DNA_cells %in% match_dna) %>% filter(RNA_cells %in% match_rna)
+
+rna <- rna[,match$RNA_cells]
+dna <- meth_dat[,match$DNA_cells]
+colnames(rna) <- colnames(dna)
+
+dim(dna)
+dim(rna)
+
+```
+
+
+```{r}
+
+obj <- Seurat::CreateSeuratObject(rna) 
+#obj <- SeuratWrappers::RunFastMNN(obj %>% Seurat::SplitObject())
+
+obj <- obj %>% 
+  Seurat::FindVariableFeatures() %>% 
+  Seurat::SCTransform() %>%
+  Seurat::RunPCA()
+
+obj <- harmony::RunHarmony(obj, group.by.vars = "orig.ident")
+obj <- obj %>% 
+  Seurat::RunUMAP(reduction="harmony",dims=1:30) %>% 
+  Seurat::FindNeighbors(reduction="harmony") %>% 
+  Seurat::FindClusters()
+
+DimPlot(obj)
+
+type_df <- left_join(data.frame(cell=rownames(obj[[]])), cell_type) %>% filter(cell %in% rownames(obj[[]]))
+type_df <- type_df[!duplicated(type_df$cell), ]
+rownames(type_df) <- type_df$cell
+dim(type_df)
+obj$cell_type <- type_df[rownames(obj[[]]),]$type
+DimPlot(obj, group.by = "cell_type")
+
+
+
+## Better plot:
+
+
+plot_df <- DimPlot(obj, group.by = "cell_type")
+
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=10)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=cell_type),size=6, alpha=0.5)+
+  scale_color_manual(values=colorRampPalette(SPATA2::color_vector(clrp="sifre"))(6))+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+
+feature="GFAP"
+plot_df <- Seurat::FeaturePlot(obj, features =  feature, order = T)
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=10)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=!!sym(feature)),size=6, alpha=0.5)+
+  scale_color_gradientn(colors=col2(50))+#, limits=c(0,10), oob=scales::squish)+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+
+
+```
+
+## Add supervised UMAP
+```{r}
+source_python("/.../Source_files/RunUMAPWrapper.py")
+
+numeric_labels <- obj$cell_type %>% as.factor() %>% as.numeric()
+mat <- obj@reductions$harmony@cell.embeddings
+sumap <- runSUMAP(mat, numeric_labels, 0.6)
+
+obj@reductions$umap@cell.embeddings[,1] <- sumap[,1]
+obj@reductions$umap@cell.embeddings[,2] <- sumap[,2]
+
+plot_df <- DimPlot(obj, group.by = "cell_type")
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=7)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=cell_type),size=3, alpha=0.5)+
+  scale_color_manual(values=colorRampPalette(py_col)(5))+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+plot_df <- DimPlot(obj, group.by = "seurat_clusters")
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=7)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=seurat_clusters),size=3, alpha=0.5)+
+  scale_color_manual(values=py_col)+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+
+obj$cell_type[obj$seurat_clusters %in% c(6)]="Macrophages"
+obj$cell_type[obj$seurat_clusters %in% c(3,1,5,7)]="Ac-like"
+obj$cell_type[obj$seurat_clusters %in% c(4)]="NPC-like"
+obj$cell_type[obj$seurat_clusters %in% c(2)]="OPC-like"
+obj$cell_type[obj$seurat_clusters %in% c(0)]="Mes-like"
+
+```
+
+
+
+
+## Methylation Data: Call the Neuron signature and overlay with single cell RNA-seq
+
+Isolate the CpGs that are used for prediction and add mask for missing CpGs
+```{r}
+list <- readRDS("~/.../input_list_training.RDS")
+training <- list$data
+class_vector <- list$class
+
+CpGs_used <-rownames(training) 
+
+
+intersect <- intersect(CpGs_used, rownames(dna))
+
+dna_sub <- dna[intersect, ]
+
+
+table(as.vector(dna_sub))
+
+## Add the mask and binarize
+dna_sub[dna_sub==0.5]=1
+
+masked <- CpGs_used[!CpGs_used%in%intersect]
+
+masked_mat <- matrix(-1, ncol=ncol(dna_sub), nrow=length(masked))
+rownames(masked_mat) <-masked 
+colnames(masked_mat) <- colnames(dna_sub)
+
+input_deep <- rbind(dna_sub, masked_mat)
+
+input_deep %>% dim()
+
+```
+
+
+
+## Input for LSTM
+```{python}
+
+# R dataframe to 2D Tensor
+import torch
+# Assuming the last column is the label
+data = torch.tensor(r.input_deep, dtype=torch.float32)
+data = torch.transpose(data, 0, 1)
+data.shape
+
+
+torch.save(data,"/.../Analysis/Models_Neural/single_cell.pt")
+
+
+```
+
+### LSTM Model:
+```{python}
+import torch
+import torch.nn as nn
+
+class CpGLSTM(nn.Module):
+    def __init__(self, num_tokens, embedding_dim, hidden_dim, num_layers, num_classes):
+        super(CpGLSTM, self).__init__()
+        self.embedding = nn.Embedding(num_tokens, embedding_dim)
+        self.lstm = nn.LSTM(embedding_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim, num_classes)
+
+    def forward(self, x, mask):
+        # Embedding layer for CpG sites
+        x = self.embedding(x)
+
+        # Apply the mask to the LSTM input
+        x = x * mask.unsqueeze(-1).float()
+
+        # LSTM layers
+        lstm_out, _ = self.lstm(x)
+
+        # Select the last time step's output for classification
+        lstm_out = lstm_out[:, -1, :]
+
+        # Fully connected layer for classification
+        out = self.fc(lstm_out)
+        return out
+model = CpGLSTM(num_tokens=3, embedding_dim=128, hidden_dim=256, num_layers=3, num_classes=2)
+```
+
+
+```{python}
+## Evaluate
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+single_cell_data = torch.load("/.../single_cell.pt")
+model = torch.load('/.../Transformer_Neural.pth')
+model.to(device)
+model.eval()
+val_outputs = []
+val_logit = []
+
+val_loader = DataLoader(single_cell_data, batch_size=32, shuffle=False)
+
+
+#inputs, labels = next(iter(val_loader))
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+for inputs in tqdm(val_loader):
+  inputs[inputs == -1] = 2  # Remap -1 to 2
+  mask = (inputs != 2)  # Adjust the mask
+  inputs = inputs.to(torch.long).to(device)
+  out = model(inputs, mask.to(device))
+  val_logit.append(out.detach().cpu().numpy())
+  val_outputs.append(torch.argmax(out, dim=1).detach().cpu().numpy())
+
+
+
+score = np.concatenate(val_logit)
+score.shape
+np.save("/.../single_cell_NeuralScore.npy", score)
+
+
+```
+
+```{python}
+## Load data:
+score = np.load("/.../single_cell_NeuralScore.npy")
+
+```
+
+```{r}
+NN_score <- data.frame(cells=colnames(input_deep), Neural_score = py$score[,2])
+obj$Neural_score <- NN_score$Neural_score
+
+feature="Neural_score"
+plot_df <- Seurat::FeaturePlot(obj, features =  feature, order = T)
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=6)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=!!sym(feature)),size=2, alpha=0.8)+
+  scale_color_gradientn(colors=col2(50), limits=c(0.2,0.5), oob=scales::squish)+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+
+
+col2=colorRampPalette(c("#FFFFFF", RColorBrewer::brewer.pal(9, "Greens")))
+
+obj[[]] %>% 
+  as.data.frame() %>% 
+  dplyr::select(cell_type, Neural_score) %>% 
+  filter(!is.na(cell_type)) %>% 
+  filter(cell_type!="Macrophages") %>% 
+  ggplot(mapping=aes(x=cell_type, y=Neural_score))+
+  geom_violin(mapping=aes(x=cell_type, y=Neural_score, fill=cell_type), trim=FALSE)+
+  geom_dotplot(binaxis = "y", stackdir = "center", binwidth=0.010)+
+  #geom_point(position = position_jitter(width = 0.2))+
+  theme_classic()+
+  #scale_fill_gradientn(colors=col2(50), limits=c(0,10), oob=scales::squish)+
+  theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+```
+
+
+Colors:
+```{python}
+import matplotlib.pyplot as plt
+cmap = plt.get_cmap('tab20')
+tab20_colors = cmap.colors
+
+# Converting RGB colors to hexadecimal format
+def rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+
+tab20_hex_colors = [rgb_to_hex(color) for color in tab20_colors]
+tab20_hex_colors
+
+cmap = plt.get_cmap('tab10')
+tab10_colors = cmap.colors
+
+# Converting RGB colors to hexadecimal format
+def rgb_to_hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(int(rgb[0]*255), int(rgb[1]*255), int(rgb[2]*255))
+
+tab10_hex_colors = [rgb_to_hex(color) for color in tab20_colors]
+tab10_hex_colors
+```
+
+```{r}
+py_col <- sample(py$tab10_hex_colors)
+```
+
+
+```{r}
+plot_df <- DimPlot(obj, group.by = "cell_type")
+ggplot(plot_df$data)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="black", size=8)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2), color="white", size=7)+
+  geom_point(aes(x=UMAP_1, y=UMAP_2, color=cell_type),size=3, alpha=0.5)+
+  scale_color_manual(values=colorRampPalette(py_col)(5))+
+  theme_bw()+
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.background = element_rect(colour = "black", size=0.5),
+          axis.text.x = element_text(colour="black", size=10,angle = 90, hjust=1), 
+          axis.text.y = element_text(colour="black", size=10, ))
+
+
+saveRDS(obj, "~/.../Seurat.RDS")
+
+
+```
+
+
+```{r}
+
+
+obj <- readRDS("~/.../Seurat.RDS")
+
+## Neftel states plot
+
+## Get neftel score
+## Load in Neftel 2019 modules (GBM)
+neftel = read.table("~/.../Neftel2019_metamodules.txt", sep = '\t', header = T, na.strings = "")
+neftel$MES.1 = gsub('\\s+', '', neftel$MES.1)
+neftel$MES.2 = gsub('\\s+', '', neftel$MES.2)
+neftel$AC = gsub('\\s+', '', neftel$AC)
+neftel$OPC = gsub('\\s+', '', neftel$OPC)
+neftel$NPC.1 = gsub('\\s+', '', neftel$NPC.1)
+neftel$NPC.2 = gsub('\\s+', '', neftel$NPC.2)
+neftel$G1.S = gsub('\\s+', '', neftel$G1.S)
+neftel$G2.M = gsub('\\s+', '', neftel$G2.M)
+
+list_neftel <- map(1:ncol(neftel), ~neftel[,.x] %>% as.character() %>% na.omit() )
+list_neftel <- map(list_neftel, ~.x[!.x=="NA"] )
+names(list_neftel) <- names(neftel)
+obj <- Seurat::AddModuleScore(obj, features = list_neftel)
+
+
+meta <- 
+  obj[[]] %>% 
+  as.data.frame() %>% 
+  dplyr::select(Neural_score,paste0("Cluster", 1:8))
+
+names(meta)[1:9] <- c("Neural_score", "Mes1","Mes2", "AC", "OPC", "Neu1","Neu2", "G1", "M")
+
+df <- meta[,c("Mes1","Mes2", "Neu1","Neu2", "OPC", "AC" )]
+df$size <- apply(df, 1, sd)
+df$Neural_score <- meta$Neural_score
+
+
+
+plotHexagonScatter(df , color_by = "Neural_score", pt.size=0.01, alpha=0.1)+
+  scale_size(range=c(0,0.1))
+
+
+
+
+
+```
+
+
+
+```{r}
+## Hexalgon Plot
+plotHexagonScatter <- function(df, pt.size=1, color_by=NULL,lable_dist=0.2, ...){
+  
+  message(".....:::::: Format Data :::::::::..........")
+  
+  df.1 <- df[, 1:6]
+  Data2 <- 
+    apply(df.1,1, function(x) {
+      x %>% 
+        as.numeric() %>% 
+        scales::rescale(., c(0,1))  %>% 
+        ohenery::normalize() }) %>% 
+    t() %>% 
+    as.data.frame()
+  names(Data2) <- names(df.1)[1:6]
+  
+  
+  message(".....:::::: Plot Data :::::::::..........")
+  
+  ### Plot Hexagon
+  path <- data.frame(Mes1 = c(1,0,0,0,0,0), Mes2 = c(0,1,0,0,0,0), Neu1 = c(0,0,1,0,0,0), Neu2 = c(0,0,0,1,0,0), OPC = c(0,0,0,0,0,1), AC = c(0,0,0,0,1,0))
+  path <- 
+    path %>%
+    mutate(Mes1.x = Mes1*cos(pi/2), Mes1.y = Mes1*sin(pi/2), 
+           Mes2.x = Mes2*cos(pi/6), Mes2.y = Mes2*sin(pi/6),
+           Neu1.x = Neu1*cos(pi/6), Neu1.y = -Neu1*sin(pi/6),
+           Neu2.x = -Neu2*cos(pi/2), Neu2.y = -Neu2*sin(pi/2),
+           AC.x= -AC*cos(pi/6),   AC.y = -AC*sin(pi/6),
+           OPC.x = -OPC*cos(pi/6),    OPC.y = OPC*sin(pi/6)) %>% 
+    mutate(x = round(Mes1.x + Mes2.x + Neu1.x+Neu2.x+OPC.x+AC.x), y = Mes1.y + Mes2.y + Neu1.y+Neu2.y+OPC.y+AC.y)
+  
+  
+  p <- 
+    ggplot()+
+    geom_path(mapping=aes(x = c(path$x, 0), y=c(path$y,1)))+
+    theme_void()+
+    geom_text(mapping=aes(x = c(path$x+path$x*lable_dist), y=c(path$y+path$y*0.1), label= names(Data2)), size = 5)+
+    theme(plot.margin = margin(3, 3, 3, 3, "cm"))+
+    coord_cartesian(clip = "off")
+  
+  
+  # Add data Layer
+  names(Data2) <- c("Mes1","Mes2", "Neu1","Neu2", "OPC", "AC" )
+  
+  Data <- 
+    Data2 %>%
+    mutate(Mes1.x = Mes1*cos(pi/2), Mes1.y = Mes1*sin(pi/2), 
+           Mes2.x = Mes2*cos(pi/6), Mes2.y = Mes2*sin(pi/6),
+           Neu1.x = Neu1*cos(pi/6), Neu1.y = -Neu1*sin(pi/6),
+           Neu2.x = -Neu2*cos(pi/2), Neu2.y = -Neu2*sin(pi/2),
+           AC.x= -AC*cos(pi/6),   AC.y = -AC*sin(pi/6),
+           OPC.x = -OPC*cos(pi/6),    OPC.y = OPC*sin(pi/6)) %>% 
+    mutate(x = (Mes1.x + Mes2.x + Neu1.x+Neu2.x+OPC.x+AC.x), y = Mes1.y + Mes2.y + Neu1.y+Neu2.y+OPC.y+AC.y)
+  
+  if(is.null(color_by)){
+    p=p+geom_point(Data, mapping=aes(x,y, ...))
+  }else{
+    Data$color <- df[,color_by] %>% as.character()
+    p=p+geom_point(Data, mapping=aes(x,y, color=color,...))
+  }
+  
+  
+  return(p)
+  
+}
+```
+
+
+
+
+
+
+
+
+
+
+## Agregated:
+
+```{r}
+
+agg <- readRDS("~/.../NM_review_data/aggregated_sc/aggregated_sc_separate_to_stem_and_diff.rds") %>% 
+  as.data.frame()
+dna <- agg[, 1:13]
+rownames(dna) <- dna$probe
+dna <- dna[, 2:13]
+
+```
+
+```{r}
+
+## Get prediction:
+
+list <- readRDS("~/.../input_list_training.RDS")
+training <- list$data
+class_vector <- list$class
+CpGs_used <-rownames(training) 
+intersect <- intersect(CpGs_used, rownames(dna))
+dna_sub <- dna[intersect, ]
+table(as.vector(dna_sub))
+## Add the mask and binarize
+dna_sub[dna_sub>0.5]=1
+dna_sub[dna_sub!=1]=0
+masked <- CpGs_used[!CpGs_used%in%intersect]
+masked_mat <- matrix(-1, ncol=ncol(dna_sub), nrow=length(masked))
+rownames(masked_mat) <-masked 
+colnames(masked_mat) <- colnames(dna_sub)
+input_deep <- rbind(dna_sub, masked_mat)
+input_deep %>% dim()
+input_deep <- input_deep %>% as.matrix()
+input_deep[is.na(input_deep)] <- -1
+library(reticulate)
+
+```
+
+
+## Do prediction:
+```{python}
+## Evaluate
+# R dataframe to 2D Tensor
+
+import torch
+# Assuming the last column is the label
+data = torch.tensor(r.input_deep, dtype=torch.float32)
+data = torch.transpose(data, 0, 1)
+data.shape
+
+
+torch.save(data,"/.../single_cell_agg.pt")
+
+
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import train_test_split
+
+single_cell_data = data#torch.load(".../single_cell_agg.pt")
+model = torch.load('/.../Transformer_Neural.pth',map_location=torch.device('cpu'))
+
+device="cpu"
+model.to("cpu")
+model.eval()
+val_outputs = []
+val_logit = []
+
+val_loader = DataLoader(single_cell_data, batch_size=1, shuffle=False)
+
+
+#inputs, labels = next(iter(val_loader))
+from tqdm import tqdm
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+for inputs in tqdm(val_loader):
+  inputs[inputs == -1] = 2  # Remap -1 to 2
+  mask = (inputs != 2)  # Adjust the mask
+  inputs = inputs.to(torch.long).to(device)
+  out = model(inputs, mask.to(device))
+  val_logit.append(out.detach().cpu().numpy())
+  val_outputs.append(torch.argmax(out, dim=1).detach().cpu().numpy())
+
+
+
+score = np.concatenate(val_logit)
+score.shape
+```
+
+```{r}
+
+NN_score <- data.frame(cells=colnames(input_deep), Neural_score = py$score[,2])
+NN_score$Neural_score <- scales::rescale(NN_score$Neural_score, c(0,0.6), mean=0.41)
+
+```
+
+
+## Hexa plot:
+```{r}
+## Get neftel score
+## Load in Neftel 2019 modules (GBM)
+neftel = read.table("~/Desktop/Cooperations/Hambardzumyan/Neftel2019_metamodules.txt", sep = '\t', header = T, na.strings = "")
+neftel$MES.1 = gsub('\\s+', '', neftel$MES.1)
+neftel$MES.2 = gsub('\\s+', '', neftel$MES.2)
+neftel$AC = gsub('\\s+', '', neftel$AC)
+neftel$OPC = gsub('\\s+', '', neftel$OPC)
+neftel$NPC.1 = gsub('\\s+', '', neftel$NPC.1)
+neftel$NPC.2 = gsub('\\s+', '', neftel$NPC.2)
+neftel$G1.S = gsub('\\s+', '', neftel$G1.S)
+neftel$G2.M = gsub('\\s+', '', neftel$G2.M)
+
+list_neftel <- map(1:ncol(neftel), ~neftel[,.x] %>% as.character() %>% na.omit() )
+list_neftel <- map(list_neftel, ~.x[!.x=="NA"] )
+names(list_neftel) <- names(neftel)
+integrated_new <- Seurat::AddModuleScore(integrated_new, features = list_neftel)
+
+
+meta <- 
+  integrated_new[[]] %>% 
+  as.data.frame() %>% 
+  filter(predicted.annotation_level_4 %in% tumor) %>% 
+  dplyr::select(genotype, paste0("Cluster", 1:8))
+
+names(meta)[2:9] <- c("Mes1","Mes2", "AC", "OPC", "Neu1","Neu2", "G1", "M")
+
+df <- meta[,c("Mes1","Mes2", "Neu1","Neu2", "OPC", "AC" )]
+df$size <- apply(df, 1, sd)
+df$genotype <- meta$genotype
+
+
+plotHexagonScatter(df %>% filter(size>0.2) , color_by = "genotype", pt.size=0.01, alpha=0.1, size=df %>% filter(size>0.2) %>% pull(size))+
+  scale_size(range=c(0,0.1))
+
+```
+
+
+
+
+
+
+
+
+
+
+
